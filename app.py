@@ -1,30 +1,30 @@
-# app.py — 8K Upscaler (No Crop, No Blur/Solid) via Mirror Padding, ≤12 MB, per-image download
+# app.py — 8K Proportional Upscaler (No Crop/Pad) + Indicators, ≤12 MB
 import io
 from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageFilter, ImageFile, ImageEnhance
-import numpy as np
-import cv2
 
 # Safety
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 SUPPORTED = ("png","jpg","jpeg","webp","bmp")
-TARGET_W, TARGET_H = 7680, 4320   # 8K exact
-MAX_MB = 12
-Q_MIN, Q_MAX = 60, 100            # JPEG 4:4:4 quality range
+LONG_SIDE_8K = 7680   # target sisi terpanjang
+TALL_SIDE_8K = 4320   # target tinggi untuk portrait
+MAX_MB = 12           # batas ukuran file
+Q_MIN, Q_MAX = 60, 100
 
-st.set_page_config(page_title="8K Upscaler — Mirror Padding", page_icon="🖼️", layout="wide")
-st.title("🖼️ 8K Upscaler — No Crop, No Blur/Solid")
-st.caption("Output selalu **8K (7680×4320)** tanpa cropping dan tanpa blur/solid: padding berupa **refleksi tepi**. Jernih & ≤ 12 MB. Unduh per gambar.")
+st.set_page_config(page_title="8K Proportional Upscaler", page_icon="🖼️", layout="wide")
+st.title("🖼️ 8K Proportional Upscaler")
+st.caption("Upscale proporsional mengikuti rasio asli (tanpa crop/padding). Sisi terpanjang → 7680 px (atau tinggi → 4320 px untuk portrait). Hasil natural tajam, file ≤ 12 MB. Unduh per gambar.")
 
 with st.sidebar:
     st.header("Pengaturan kualitas")
     resampler = st.radio("Resampler (upscale)", ["Bicubic (disarankan)", "Lanczos"], index=0)
     sharpen_amt = st.slider("Penajaman halus", 0.0, 2.0, 0.8, 0.1, help="0.6–1.0 biasanya pas; >1.2 berisiko halo.")
     micro_contrast = st.slider("Mikro-kontras", 1.0, 1.6, 1.1, 0.05)
-    suffix = st.text_input("Akhiran nama file", value="8K")
+    keep_if_bigger = st.toggle("Jika sumber > 8K, biarkan (jangan downscale)", value=True)
+    suffix = st.text_input("Akhiran nama file", value="8K-prop")
 
 uploaded = st.file_uploader("Pilih hingga 10 gambar", type=list(SUPPORTED), accept_multiple_files=True)
 if uploaded and len(uploaded) > 10:
@@ -33,40 +33,42 @@ if uploaded and len(uploaded) > 10:
 
 # ---------- utils ----------
 
-def fit_inside(img: Image.Image, tw: int, th: int, method: str = "bicubic") -> Image.Image:
-    """Resize proporsional agar MUAT di dalam (tw, th) tanpa distorsi."""
+def orientation_of(w: int, h: int) -> str:
+    if w > h:
+        return "Landscape"
+    elif h > w:
+        return "Portrait"
+    else:
+        return "Square"
+
+def resize_longest_to_8k(img: Image.Image, method: str = "bicubic", keep_if_bigger: bool = True):
+    """
+    Return (resized_img, scale_factor, target_side_used)
+    - Landscape/Square: width -> 7680
+    - Portrait: height -> 4320
+    - scale_factor = faktor pembesaran (>=1 untuk upscale, 1 jika tidak diubah)
+    - target_side_used = "width" atau "height" (informasi indikator)
+    """
     filt = Image.BICUBIC if method == "bicubic" else Image.LANCZOS
     w, h = img.size
-    ar_s, ar_t = w/h, tw/th
-    if ar_s > ar_t:
-        new_w = tw
-        new_h = max(1, int(tw / ar_s))
+    if w >= h:
+        # landscape/square → target lebar 7680
+        if keep_if_bigger and w >= LONG_SIDE_8K:
+            return img, 1.0, "width"
+        scale = LONG_SIDE_8K / w
+        new_w = LONG_SIDE_8K
+        new_h = max(1, int(h * scale))
+        return img.resize((new_w, new_h), filt), scale, "width"
     else:
-        new_h = th
-        new_w = max(1, int(th * ar_s))
-    return img.resize((new_w, new_h), filt)
-
-def mirror_pad_to_8k(pil_img: Image.Image, tw: int, th: int) -> Image.Image:
-    """
-    Pad ke ukuran target dengan REFLEKSI (tanpa crop, tanpa blur/solid).
-    Menggunakan cv2.copyMakeBorder(BORDER_REFLECT_101) agar natural.
-    """
-    # ke BGR numpy
-    arr = np.array(pil_img.convert("RGB"))[:, :, ::-1]  # RGB->BGR
-    h, w = arr.shape[:2]
-    pad_l = (tw - w) // 2
-    pad_r = tw - w - pad_l
-    pad_t = (th - h) // 2
-    pad_b = th - h - pad_t
-    # Jika tidak pas, lakukan refleksi
-    if pad_l < 0 or pad_r < 0 or pad_t < 0 or pad_b < 0:
-        raise ValueError("Ukuran sumber lebih besar dari target—pastikan sudah di-resize fit terlebih dahulu.")
-    out = cv2.copyMakeBorder(arr, pad_t, pad_b, pad_l, pad_r, borderType=cv2.BORDER_REFLECT_101)
-    # back to PIL
-    return Image.fromarray(out[:, :, ::-1])
+        # portrait → target tinggi 4320
+        if keep_if_bigger and h >= TALL_SIDE_8K:
+            return img, 1.0, "height"
+        scale = TALL_SIDE_8K / h
+        new_h = TALL_SIDE_8K
+        new_w = max(1, int(w * scale))
+        return img.resize((new_w, new_h), filt), scale, "height"
 
 def gentle_sharpen(pil_img: Image.Image, sharp=0.8, micro_c=1.1) -> Image.Image:
-    # Unsharp ringan + micro contrast kecil → natural, minim halo
     out = pil_img.filter(ImageFilter.UnsharpMask(radius=0.9, percent=120, threshold=2))
     if abs(sharp - 1.0) > 1e-3:
         out = ImageEnhance.Sharpness(out).enhance(sharp)
@@ -82,13 +84,12 @@ def encode_jpeg_444(im: Image.Image, q: int) -> bytes:
 
 def maximize_under_cap(im: Image.Image, cap_bytes: int):
     """
-    Binary search kualitas agar ukuran mendekati cap (≤ 12 MB) dengan JPEG 4:4:4.
-    Jika q=100 masih ≤ cap → pakai q=100 (maksimal).
+    Binary search kualitas agar ukuran mendekati cap (≤ MAX_MB) dengan 4:4:4.
+    Jika q=100 masih ≤ cap → pakai q=100 (maks).
     """
     hi = encode_jpeg_444(im, 100)
     if len(hi) <= cap_bytes:
         return hi, 100, "q=100 (maks)"
-
     lo_q, hi_q = Q_MIN, Q_MAX
     best = (encode_jpeg_444(im, lo_q), lo_q)
     while lo_q <= hi_q:
@@ -101,8 +102,8 @@ def maximize_under_cap(im: Image.Image, cap_bytes: int):
             hi_q = mid - 1
     return best[0], best[1], "tight fit"
 
-# ---------- main ----------
-if st.button("🚀 Proses ke 8K (tanpa crop & tanpa blur/solid)"):
+# ---------- proses ----------
+if st.button("🚀 Proses (8K proportional, tanpa crop/padding)"):
     if not uploaded:
         st.warning("Unggah minimal satu gambar.")
     else:
@@ -121,25 +122,40 @@ if st.button("🚀 Proses ke 8K (tanpa crop & tanpa blur/solid)"):
                 else:
                     img = img.convert("RGB")
 
-                # 1) Resize MUAT di dalam 8K (tanpa distorsi)
+                # Info sumber
+                src_w, src_h = img.size
+                src_orient = orientation_of(src_w, src_h)
+
+                # 1) Resize proporsional (tanpa crop/padding)
                 method = "bicubic" if "Bicubic" in resampler else "lanczos"
-                fitted = fit_inside(img, TARGET_W, TARGET_H, method=method)
+                out, scale_factor, target_side_used = resize_longest_to_8k(img, method=method, keep_if_bigger=keep_if_bigger)
 
-                # 2) Mirror padding agar jadi 8K tepat (tanpa crop, tanpa blur/solid)
-                out = mirror_pad_to_8k(fitted, TARGET_W, TARGET_H)
-
-                # 3) Penajaman natural
+                # 2) Penajaman natural
                 out = gentle_sharpen(out, sharpen_amt, micro_contrast)
 
-                # 4) Encode maksimal hingga ≤ 12 MB (JPEG 4:4:4)
+                # 3) Encode maksimal hingga ≤ 12 MB (JPEG 4:4:4)
                 data, used_q, note = maximize_under_cap(out, cap_bytes)
+
+                # Indikator & caption
+                new_w, new_h = out.size
+                # Skala total relatif sisi terpanjang sumber → sisi terpanjang hasil
+                if src_w >= src_h:
+                    factor = new_w / src_w
+                else:
+                    factor = new_h / src_h
+                factor_str = f"{factor:.2f}×" if factor >= 0 else "1.00×"
+                aspect_str = f"{new_w}:{new_h}"
 
                 name = f"{Path(f.name).stem}_{suffix}.jpg"
                 size_mb = len(data) / (1024 * 1024)
-                st.image(out, caption=f"{name} — {out.width}×{out.height}px | q={used_q} | {size_mb:.2f} MB ({note})",
-                         use_column_width=True)
+                caption = (
+                    f"{name} — {new_w}×{new_h}px | {src_orient} | upscale {factor_str} | q={used_q} "
+                    f"| {size_mb:.2f} MB ({note}) | ratio {aspect_str}"
+                )
+
+                st.image(out, caption=caption, use_column_width=True)
                 st.download_button(f"⬇️ Unduh {name}", data, file_name=name, mime="image/jpeg")
 
             except Exception as e:
                 st.error(f"Gagal memproses {f.name}: {e}")
-            progress.progress(i / len(uploaded))                
+            progress.progress(i / len(uploaded))
