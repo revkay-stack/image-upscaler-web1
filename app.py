@@ -1,248 +1,171 @@
-# app.py — 8K Upscaler (Detail-Preserving + Direct Downloads)
-import io, math
+# app.py — 8K Natural Upscaler (Clean, ≤12 MB, per-image download)
+import io
 from pathlib import Path
 import streamlit as st
-from PIL import Image, ImageFilter, ImageEnhance, ImageFile
-import numpy as np
+from PIL import Image, ImageFilter, ImageFile, ImageEnhance
 
-# Coba pakai OpenCV headless untuk peningkatan detail
+# OpenCV opsional (default OFF supaya hasil natural)
 try:
     import cv2
     HAS_CV2 = True
 except Exception:
     HAS_CV2 = False
 
-# Keamanan & kompatibilitas Pillow
+# Keamanan Pillow
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-SUPPORTED_TYPES = ("png", "jpg", "jpeg", "webp", "bmp")
-TARGET_SIZE = (7680, 4320)   # 8K fit (proporsional)
-MAX_MB = 12                  # batas ukuran file
+SUPPORTED = ("png","jpg","jpeg","webp","bmp")
+TARGET = (7680, 4320)  # 8K fit (tanpa distorsi)
+MAX_MB = 12            # batas ukuran keras
+Q_MIN, Q_MAX = 60, 100 # kualitas JPEG minimum & maksimum
 
-st.set_page_config(page_title="8K Image Upscaler", page_icon="🖼️", layout="wide")
-st.title("🖼️ 8K Image Upscaler — Detail Preserving")
-st.caption("Semua gambar di-upscale proporsional ke **8K (fit)**, ditajamkan cerdas, dan **maks ≤ 12 MB**. Unduh tiap gambar langsung (tanpa ZIP).")
+st.set_page_config(page_title="8K Natural Upscaler", page_icon="🖼️", layout="wide")
+st.title("🖼️ 8K Natural Upscaler")
+st.caption("Upscale proporsional ke 8K dengan tampilan alami, tajam tapi tidak berlebihan. Ukuran file otomatis ≤ 12 MB. Unduh tiap gambar langsung.")
 
 with st.sidebar:
-    st.header("Pengaturan")
-    # Penajaman adaptif (post-resize)
-    sharp_boost = st.slider("Tingkat ketajaman", 1.0, 3.0, 1.6, 0.1)
-    contrast_boost = st.slider("Tingkat kontras", 1.0, 2.0, 1.15, 0.05)
-    # Detail enhancer OpenCV
-    if HAS_CV2:
-        detail_strength = st.slider("Detail enhance (OpenCV)", 0, 100, 35, 5, help="Semakin besar, semakin muncul micro-detail; jangan berlebihan.")
-    else:
-        st.info("OpenCV tidak terpasang — fallback Pillow akan dipakai (tetap tajam).")
-        detail_strength = 0
+    st.header("Pengaturan kualitas")
+    # Resampler: Bicubic untuk upscale besar → lebih sedikit halo daripada Lanczos
+    resampler = st.radio("Resampler (upscale)", ["Bicubic (disarankan)","Lanczos"], index=0)
+    sharpen_amt = st.slider("Penajaman halus", 0.0, 2.0, 0.8, 0.1, help="0.6–1.0 biasanya pas; >1.2 berisiko halo.")
+    micro_contrast = st.slider("Mikro-kontras", 1.0, 1.6, 1.1, 0.05, help="Sedikit saja agar tidak 'kasar'.")
+    use_cv2 = st.toggle("Aktifkan OpenCV detail (opsional)", value=False and HAS_CV2, help="Hanya jika benar-benar perlu. Default OFF agar natural.")
+    fmt = st.selectbox("Format keluaran", ["JPEG (4:4:4)", "WebP"], index=0)
     suffix = st.text_input("Akhiran nama file", value="8K")
-    show_zip_toggle = st.toggle("Tampilkan tombol ZIP juga (opsional)", value=False)
 
-uploaded = st.file_uploader(
-    "Pilih hingga 10 gambar",
-    type=list(SUPPORTED_TYPES),
-    accept_multiple_files=True
-)
+uploaded = st.file_uploader("Pilih hingga 10 gambar", type=list(SUPPORTED), accept_multiple_files=True)
 if uploaded and len(uploaded) > 10:
     st.warning("Maksimal 10 gambar per proses. Hanya 10 pertama diproses.")
     uploaded = uploaded[:10]
 
-# ---------- Utilitas ----------
+# ---------- util ----------
 
-def fit_to_box_wh(w, h, tw, th):
-    """Hitung ukuran proporsional agar muat di (tw, th) tanpa distorsi."""
-    aspect_src = w / h
-    aspect_tgt = tw / th
-    if aspect_src > aspect_tgt:
-        new_w = tw
-        new_h = int(tw / aspect_src)
+def fit_size(w, h, tw, th):
+    ar_s, ar_t = w/h, tw/th
+    if ar_s > ar_t:
+        return tw, int(tw/ar_s)
     else:
-        new_h = th
-        new_w = int(th * aspect_src)
-    return new_w, new_h
+        return int(th*ar_s), th
 
-def staged_resize_lanczos(pil_img: Image.Image, target_wh, max_step=1.8):
-    """
-    Upscale bertahap (≤ max_step per tahap) untuk mengurangi artefak.
-    """
+def upscale_staged(pil_img: Image.Image, target_wh, method="bicubic", max_step=1.8):
+    filt = Image.BICUBIC if method=="bicubic" else Image.LANCZOS
     w, h = pil_img.size
     tw, th = target_wh
-    # Jika turun ukuran besar → langsung sekali
+    # downscale besar → sekali langkah cukup
     if tw <= w and th <= h:
         return pil_img.resize((tw, th), Image.LANCZOS)
-
     out = pil_img
     while max(out.width, out.height) < max(tw, th):
-        scale = min(max_step, max(tw / out.width, th / out.height))
-        nw = min(tw, int(out.width * scale))
-        nh = min(th, int(out.height * scale))
-        if nw == out.width and nh == out.height:
-            break
-        out = out.resize((nw, nh), Image.LANCZOS)
+        scale = min(max_step, max(tw/out.width, th/out.height))
+        nw = min(tw, int(out.width*scale))
+        nh = min(th, int(out.height*scale))
+        if (nw, nh) == (out.width, out.height): break
+        out = out.resize((nw, nh), filt)
     if (out.width, out.height) != (tw, th):
-        out = out.resize((tw, th), Image.LANCZOS)
+        out = out.resize((tw, th), filt)
     return out
 
-def cv2_detail_pipeline(pil_img: Image.Image, strength: int):
-    """
-    Pipeline detail-preserving berbasis OpenCV:
-    - Bilateral smoothing ringan untuk kurangi noise
-    - DetailEnhance (edge-aware)
-    - CLAHE pada channel L di LAB (kontras lokal)
-    - Unsharp mask halus
-    """
-    if not HAS_CV2 or strength <= 0:
-        return pil_img
+def cv2_light_detail(pil_img: Image.Image):
+    if not HAS_CV2: return pil_img
+    img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    # sangat ringan: bilateral kecil + unsharp halus
+    img = cv2.bilateralFilter(img, d=5, sigmaColor=20, sigmaSpace=20)
+    blur = cv2.GaussianBlur(img, (0,0), 0.7)
+    img = cv2.addWeighted(img, 1.15, blur, -0.15, 0)
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
-    img = np.array(pil_img.convert("RGB"))[:, :, ::-1]  # PIL RGB -> BGR
-    # Noise reduction ringan (bilateral kecil agar edge terjaga)
-    img = cv2.bilateralFilter(img, d=5, sigmaColor=30, sigmaSpace=30)
-
-    # Detail enhance (sigma_r ~ 0.1..0.25 tergantung strength)
-    sigma_r = max(0.05, min(0.25, strength / 200.0))
-    sigma_s = 10 + int(strength / 4)   # spatial
-    img = cv2.detailEnhance(img, sigma_s=sigma_s, sigma_r=sigma_r)
-
-    # CLAHE pada L channel
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    l2 = clahe.apply(l)
-    lab2 = cv2.merge((l2, a, b))
-    img = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
-
-    # Unsharp mask halus (radius 0.8 ~ 1.2)
-    blur = cv2.GaussianBlur(img, (0,0), sigmaX=0.8)
-    img = cv2.addWeighted(img, 1.25, blur, -0.25, 0)
-
-    out = Image.fromarray(img[:, :, ::-1])  # BGR -> RGB back to PIL
+def gentle_sharpen(pil_img: Image.Image, sharp=0.8, micro_c=1.1):
+    # Unsharp ringan → sedikit sharpness & micro-contrast
+    out = pil_img.filter(ImageFilter.UnsharpMask(radius=0.9, percent=120, threshold=2))
+    if abs(sharp-1.0) > 1e-3:
+        out = ImageEnhance.Sharpness(out).enhance(sharp)
+    if abs(micro_c-1.0) > 1e-3:
+        out = ImageEnhance.Contrast(out).enhance(micro_c)
     return out
 
-def pillow_sharpen_pipeline(pil_img: Image.Image, sharp_boost: float, contrast_boost: float):
-    """
-    Fallback jika tanpa OpenCV: kombinasi Unsharp + Sharpness + Contrast.
-    """
-    out = pil_img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=170, threshold=2))
-    out = ImageEnhance.Sharpness(out).enhance(sharp_boost)
-    out = ImageEnhance.Contrast(out).enhance(contrast_boost)
-    out = out.filter(ImageFilter.UnsharpMask(radius=0.8, percent=120, threshold=2))
-    return out
-
-def encode_jpeg_444(im: Image.Image, q: int):
-    """
-    JPEG 4:4:4 (subsampling=0) untuk menjaga detail warna saat zoom.
-    """
-    if im.mode != "RGB":
-        im = im.convert("RGB")
+def encode_jpeg_444(im: Image.Image, q: int) -> bytes:
+    if im.mode != "RGB": im = im.convert("RGB")
     buf = io.BytesIO()
-    im.save(
-        buf, format="JPEG",
-        quality=q, optimize=True, progressive=True,
-        subsampling=0  # 4:4:4 = tidak buang chroma detail
-    )
+    im.save(buf, "JPEG", quality=q, optimize=True, progressive=True, subsampling=0)  # 4:4:4
     return buf.getvalue()
 
-def save_jpeg_maximize(im: Image.Image, target_bytes: int, q_min=40, q_max=100):
-    """
-    Naikkan kualitas setinggi mungkin hingga mendekati target_bytes (≤ MAX_MB).
-    - Jika q=100 masih < target → pakai q=100 (maksimal).
-    - Binary search untuk tight fit.
-    """
-    data_hi = encode_jpeg_444(im, q_max)
-    if len(data_hi) <= target_bytes:
-        return data_hi, q_max, "q=100 (maksimum)"
+def encode_webp(im: Image.Image, q: int) -> bytes:
+    if im.mode != "RGB": im = im.convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, "WEBP", quality=q, method=6)  # method 6 = terbaik
+    return buf.getvalue()
 
-    data_lo = encode_jpeg_444(im, q_min)
-    if len(data_lo) > target_bytes:
-        # Binary search turun
-        lo, hi = q_min, q_max
-        best = (data_lo, q_min)
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            data = encode_jpeg_444(im, mid)
+def maximize_under_cap(im: Image.Image, target_bytes: int, webp=False):
+    encode = (lambda I,q: encode_webp(I,q)) if webp else (lambda I,q: encode_jpeg_444(I,q))
+    # Jika q=100 masih <= cap → pakai 100
+    hi = encode(im, 100)
+    if len(hi) <= target_bytes:
+        return hi, 100, "q=100"
+    # Binary search tight fit
+    lo_q, hi_q = Q_MIN, Q_MAX
+    best = (encode(im, lo_q), lo_q)
+    if len(best[0]) > target_bytes:
+        # turunkan kualitas (jarang untuk JPEG 8K), tetap binary
+        while lo_q <= hi_q:
+            mid = (lo_q + hi_q)//2
+            data = encode(im, mid)
             if len(data) <= target_bytes:
-                best = (data, mid)
-                lo = mid + 1
+                best = (data, mid); lo_q = mid + 1
             else:
-                hi = mid - 1
-        return best[0], best[1], "binary down (tight fit)"
+                hi_q = mid - 1
+        return best[0], best[1], "tight fit (down)"
+    else:
+        # naikan kualitas mendekati cap
+        while lo_q <= hi_q:
+            mid = (lo_q + hi_q)//2
+            data = encode(im, mid)
+            if len(data) <= target_bytes:
+                best = (data, mid); lo_q = mid + 1
+            else:
+                hi_q = mid - 1
+        return best[0], best[1], "tight fit (up)"
 
-    # Binary search naik (kasus umum)
-    lo, hi = q_min, q_max
-    best = (data_lo, q_min)
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        data = encode_jpeg_444(im, mid)
-        if len(data) <= target_bytes:
-            best = (data, mid)
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best[0], best[1], "binary up (tight fit)"
+# numpy hanya jika cv2 ON
+import numpy as np if False else None  # placeholder untuk linting di editor web
 
-# ---------- Proses ----------
+# ---------- proses ----------
 if st.button("🚀 Proses ke 8K (tanpa ZIP)"):
     if not uploaded:
         st.warning("Unggah minimal satu gambar.")
     else:
+        cap_bytes = int(MAX_MB * 1024 * 1024)
         results = []
         progress = st.progress(0)
-        target_bytes = int(MAX_MB * 1024 * 1024)
-
         for i, f in enumerate(uploaded, start=1):
             try:
-                # Load & konversi aman
                 img = Image.open(f)
-                if img.mode not in ("RGB", "RGBA", "L"):
+                if img.mode == "RGBA":
+                    bg = Image.new("RGB", img.size, (255,255,255))
+                    bg.paste(img, mask=img.split()[-1]); img = bg
+                elif img.mode not in ("RGB","L"):
                     img = img.convert("RGB")
-                elif img.mode == "RGBA":
-                    # Hilangkan alpha ke putih (agar hasil JPEG clean)
-                    bg = Image.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[-1])
-                    img = bg
-                else:
-                    img = img.convert("RGB")
-
-                # 1) Tentukan ukuran target fit 8K (proporsional)
-                tw, th = TARGET_SIZE
-                new_w, new_h = fit_to_box_wh(img.width, img.height, tw, th)
-
-                # 2) Upscale bertahap untuk mengurangi artefak
-                up = staged_resize_lanczos(img, (new_w, new_h), max_step=1.8)
-
-                # 3) Detail enhancement (OpenCV jika ada, else Pillow)
-                if HAS_CV2 and detail_strength > 0:
-                    up = cv2_detail_pipeline(up, detail_strength)
-                else:
-                    up = pillow_sharpen_pipeline(up, sharp_boost, contrast_boost)
-
-                # 4) Maksimalkan kualitas sampai ~12MB (JPEG 4:4:4)
-                data, used_q, note = save_jpeg_maximize(up, target_bytes)
-
-                # 5) Tampilkan & tombol unduh (langsung per-gambar)
-                name = f"{Path(f.name).stem}_{suffix}.jpg"
-                size_mb = len(data) / (1024 * 1024)
-                st.image(up, caption=f"{name} — {up.width}×{up.height}px | q={used_q} | {size_mb:.2f} MB ({note})", use_column_width=True)
-                st.download_button(f"⬇️ Unduh {name}", data, file_name=name, mime="image/jpeg")
-
+                # 1) Fit proporsional ke 8K
+                tw, th = TARGET
+                new_w, new_h = fit_size(img.width, img.height, tw, th)
+                out = upscale_staged(img, (new_w, new_h),
+                                     method="bicubic" if "Bicubic" in resampler else "lanczos")
+                # 2) (Opsional) CV2 detail ringan
+                if use_cv2 and HAS_CV2:
+                    out = cv2_light_detail(out)
+                # 3) Sharpen halus & mikro-kontras kecil
+                out = gentle_sharpen(out, sharpen_amt, micro_contrast)
+                # 4) Encode maksimal sampai mendekati 12 MB
+                webp = (fmt.startswith("WebP"))
+                data, used_q, note = maximize_under_cap(out, cap_bytes, webp=webp)
+                ext = "webp" if webp else "jpg"
+                mime = "image/webp" if webp else "image/jpeg"
+                name = f"{Path(f.name).stem}_{suffix}.{ext}"
+                size_mb = len(data)/(1024*1024)
+                st.image(out, caption=f"{name} — {out.width}×{out.height}px | q={used_q} | {size_mb:.2f} MB ({note})",
+                         use_column_width=True)
+                st.download_button(f"⬇️ Unduh {name}", data, file_name=name, mime=mime)
                 results.append((name, data))
             except Exception as e:
                 st.error(f"Gagal memproses {f.name}: {e}")
-            progress.progress(i / len(uploaded))
-
-        # ZIP opsional — hanya kalau kamu menyalakan toggle di sidebar
-        if results and show_zip_toggle:
-            import zipfile
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for n, d in results:
-                    zf.writestr(n, d)
-            st.download_button("📦 (Opsional) Unduh Semua (ZIP)", buf.getvalue(), file_name="upscaled_8k.zip", mime="application/zip")
-
-st.markdown("---")
-st.markdown("""
-**Tips kejernihan saat zoom**
-- Gunakan sumber foto berkualitas tinggi (noise rendah).
-- Hindari kompresi berlapis (JPEG → edit → JPEG → edit); usahakan dari PNG/RAW bila ada.
-- Pipeline ini: **staged Lanczos → detail enhance (edge-aware) → CLAHE (OpenCV) / Unsharp** → **JPEG 4:4:4**.
-""")
+            progress.progress(i/len(uploaded))
