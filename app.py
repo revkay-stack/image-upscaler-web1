@@ -1,4 +1,4 @@
-# app.py — Proportional Upscaler 4×/8× + Presets (Natural / Anti-Halo / Tekstur Kain)
+# app.py — Proportional Upscaler 8× + Presets + Before/After Preview (≤12 MB)
 import io, math
 from pathlib import Path
 import streamlit as st
@@ -12,55 +12,44 @@ SUPPORTED = ("png","jpg","jpeg","webp","bmp")
 MAX_MB = 12                      # batas ukuran file
 Q_MIN, Q_MAX = 60, 100           # range kualitas JPEG (4:4:4)
 MAX_OUT_PIXELS = 120_000_000     # pagar aman Cloud (~120 MP)
+REQ_FACTOR = 8.0                 # faktor upscale tetap 8×
 
-st.set_page_config(page_title="Proportional Upscaler 4× / 8× — Presets", page_icon="🖼️", layout="wide")
-st.title("🖼️ Proportional Upscaler — 4× / 8× (dengan Preset)")
-st.caption("Upscale proporsional 4×/8× tanpa crop/padding. Preset cepat: Natural, Anti-Halo, Tekstur Kain. File dimaksimalkan hingga ≤ 12 MB per gambar (JPEG 4:4:4).")
+st.set_page_config(page_title="Proportional Upscaler 8× — Presets", page_icon="🖼️", layout="wide")
+st.title("🖼️ Proportional Upscaler — 8× (dengan Preset & Preview)")
+st.caption("Upscale proporsional 8× tanpa crop/padding. Preset cepat: Natural, Anti-Halo, Tekstur Kain (atau Kustom). File dimaksimalkan hingga ≤ 12 MB per gambar (JPEG 4:4:4).")
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.header("Pengaturan Utama")
-    factor_choice = st.radio("Faktor upscale", ["4×", "8×"], index=0)
+    st.header("Pengaturan")
     preset = st.selectbox("Preset kualitas", ["Default Natural", "Anti-Halo", "Tekstur Kain", "Kustom"], index=0)
-    keep_if_bigger = st.toggle("Jika sumber > ukuran target, jangan perkecil (keep)", value=True)
-    suffix = st.text_input("Akhiran nama file", value="upscaled")
+    keep_if_bigger = st.toggle("Jika sumber sudah besar, jangan perkecil (keep)", value=True)
+    suffix = st.text_input("Akhiran nama file", value="x8")
 
-    # Parameter kustom / pengganti preset
-    show_advanced = (preset == "Kustom")
     st.markdown("---")
-    st.subheader("Tweak lanjutan" + (" (aktif karena Kustom)" if show_advanced else " (opsional)"))
-    resampler_ui = st.radio("Resampler", ["Bicubic", "Lanczos"], index=0 if preset != "Tekstur Kain" else 1, disabled=not show_advanced)
-    sharpen_amt_ui = st.slider("Penajaman (Sharpness)", 0.0, 2.0, 0.8, 0.1, disabled=not show_advanced)
-    micro_contrast_ui = st.slider("Mikro-kontras", 1.0, 1.6, 1.1, 0.05, disabled=not show_advanced)
-    usm_radius_ui = st.slider("USM Radius", 0.3, 2.0, 0.9, 0.1, disabled=not show_advanced)
-    usm_percent_ui = st.slider("USM Percent", 50, 250, 120, 5, disabled=not show_advanced)
-    usm_thresh_ui = st.slider("USM Threshold", 0, 10, 2, 1, disabled=not show_advanced)
+    st.subheader("Tweak lanjutan" + (" (aktif karena Kustom)" if preset == "Kustom" else " (opsional)"))
+    resampler_ui = st.radio("Resampler", ["Bicubic", "Lanczos"], index=0 if preset != "Tekstur Kain" else 1, disabled=(preset!="Kustom"))
+    sharpen_amt_ui = st.slider("Penajaman (Sharpness)", 0.0, 2.0, 0.8, 0.1, disabled=(preset!="Kustom"))
+    micro_contrast_ui = st.slider("Mikro-kontras", 1.0, 1.6, 1.1, 0.05, disabled=(preset!="Kustom"))
+    usm_radius_ui = st.slider("USM Radius", 0.3, 2.0, 0.9, 0.1, disabled=(preset!="Kustom"))
+    usm_percent_ui = st.slider("USM Percent", 50, 250, 120, 5, disabled=(preset!="Kustom"))
+    usm_thresh_ui = st.slider("USM Threshold", 0, 10, 2, 1, disabled=(preset!="Kustom"))
 
 uploaded = st.file_uploader("Pilih hingga 10 gambar", type=list(SUPPORTED), accept_multiple_files=True)
 if uploaded and len(uploaded) > 10:
     st.warning("Maksimal 10 gambar per proses. Hanya 10 pertama diproses.")
     uploaded = uploaded[:10]
 
-# ---------- Preset definitions ----------
+# ---------- Preset ----------
 def resolve_params(preset_name: str):
-    """
-    Kembalikan dict parameter:
-    - resampler: 'bicubic' | 'lanczos'
-    - sharpen_amt: 0.0..2.0  (ImageEnhance.Sharpness)
-    - micro_contrast: 1.0..1.6 (ImageEnhance.Contrast)
-    - usm_radius, usm_percent, usm_thresh: UnsharpMask
-    """
     if preset_name == "Default Natural":
         return dict(resampler="bicubic", sharpen_amt=0.8, micro_contrast=1.10, usm_radius=0.9, usm_percent=120, usm_thresh=2)
     if preset_name == "Anti-Halo":
-        # Lebih halus di tepi, minim ringing
         return dict(resampler="bicubic", sharpen_amt=0.6, micro_contrast=1.05, usm_radius=0.7, usm_percent=90, usm_thresh=3)
     if preset_name == "Tekstur Kain":
-        # Tekankan detail serat/tekstur ringan (hati-hati halo)
         return dict(resampler="lanczos", sharpen_amt=1.1, micro_contrast=1.20, usm_radius=1.0, usm_percent=140, usm_thresh=2)
-    # Kustom: ambil dari UI
+    # Kustom
     return dict(
-        resampler="bicubic" if resampler_ui == "Bicubic" else "lanczos",
+        resampler=("bicubic" if resampler_ui == "Bicubic" else "lanczos"),
         sharpen_amt=sharpen_amt_ui,
         micro_contrast=micro_contrast_ui,
         usm_radius=usm_radius_ui,
@@ -116,19 +105,18 @@ def maximize_under_cap(im: Image.Image, cap_bytes: int):
     return best[0], best[1], "tight fit"
 
 # ---------- Process ----------
-if st.button("🚀 Proses (4× / 8× + preset)"):
+if st.button("🚀 Proses 8× (dengan Preview)"):
     if not uploaded:
         st.warning("Unggah minimal satu gambar.")
     else:
         cap_bytes = int(MAX_MB * 1024 * 1024)
         params = resolve_params(preset)
-        req_factor = 4.0 if factor_choice.startswith("4") else 8.0
 
         progress = st.progress(0)
         for i, f in enumerate(uploaded, start=1):
             try:
                 img = Image.open(f)
-                # Normalisasi mode ke RGB
+                # Normalisasi ke RGB
                 if img.mode == "RGBA":
                     bg = Image.new("RGB", img.size, (255,255,255))
                     bg.paste(img, mask=img.split()[-1]); img = bg
@@ -140,12 +128,11 @@ if st.button("🚀 Proses (4× / 8× + preset)"):
                 src_w, src_h = img.size
                 src_orient = orientation_of(src_w, src_h)
 
-                # 1) Upscale dengan faktor (aman Cloud)
-                method = params["resampler"]
-                out, eff_factor, was_capped = resize_with_factor(img, req_factor, method=method)
+                # 1) Upscale 8× (aman Cloud)
+                out, eff_factor, was_capped = resize_with_factor(img, REQ_FACTOR, method=params["resampler"])
 
-                # Jika sumber lebih besar & keep_if_bigger aktif, bisa jadi eff_factor=1.0
-                if keep_if_bigger and ((src_w >= out.width) or (src_h >= out.height)):
+                # Jika sumber lebih besar & keep_if_bigger aktif, biarkan asli (tanpa downscale)
+                if keep_if_bigger and (out.width <= src_w or out.height <= src_h):
                     out = img
                     eff_factor = 1.0
                     was_capped = False
@@ -163,23 +150,28 @@ if st.button("🚀 Proses (4× / 8× + preset)"):
                 # 3) Encode maksimal hingga ≤ 12 MB (JPEG 4:4:4)
                 data, used_q, note = maximize_under_cap(out, cap_bytes)
 
-                # 4) Caption & download
-                new_w, new_h = out.size
-                size_mb = len(data) / (1024 * 1024)
-                cap = (
-                    f"{Path(f.name).stem}_{suffix}.jpg — {new_w}×{new_h}px | {src_orient} | "
-                    f"req {req_factor:.1f}× → eff {eff_factor:.2f}×"
-                    + (" (capped)" if was_capped else "")
-                    + f" | preset: {preset} | q={used_q} | {size_mb:.2f} MB ({note})"
-                )
-                st.image(out, caption=cap, use_column_width=True)
-                st.download_button(
-                    f"⬇️ Unduh {Path(f.name).stem}_{suffix}.jpg",
-                    data,
-                    file_name=f"{Path(f.name).stem}_{suffix}.jpg",
-                    mime="image/jpeg"
-                )
+                # 4) Preview Before / After + Download
+                col1, col2 = st.columns(2, gap="large")
+                with col1:
+                    st.subheader("Sebelum")
+                    st.image(img, caption=f"{f.name} — {src_w}×{src_h}px | {src_orient}", use_column_width=True)
+                with col2:
+                    st.subheader("Sesudah (8×)")
+                    new_w, new_h = out.size
+                    size_mb = len(data) / (1024 * 1024)
+                    captext = (
+                        f"{Path(f.name).stem}_{suffix}.jpg — {new_w}×{new_h}px | {src_orient} | "
+                        f"req 8.0× → eff {eff_factor:.2f}×" + (" (capped)" if was_capped else "") +
+                        f" | preset: {preset} | q={used_q} | {size_mb:.2f} MB ({note})"
+                    )
+                    st.image(out, caption=captext, use_column_width=True)
+                    st.download_button(
+                        "⬇️ Unduh hasil",
+                        data,
+                        file_name=f"{Path(f.name).stem}_{suffix}.jpg",
+                        mime="image/jpeg"
+                    )
 
             except Exception as e:
                 st.error(f"Gagal memproses {f.name}: {e}")
-            progress.progress(i / len(uploaded))
+            progress.progress(i / len(uploaded))                            
