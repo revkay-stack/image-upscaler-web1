@@ -1,30 +1,44 @@
-# app.py — Auto 8× Upscaler (Optimized) + Face Glow + Matte Skin + Face Count + ZIP
+# app.py — Auto 8× Upscaler (Optimized) + Face Glow + Matte Skin + Pro Camera Look + ZIP
 import io, math, gc, zipfile
 from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageFilter, ImageFile, ImageEnhance
 import numpy as np
 
-# OpenCV optional (graceful fallback)
+# -------- Optional OpenCV (graceful fallback) --------
 try:
     import cv2
     HAS_CV2 = True
 except Exception:
     HAS_CV2 = False
 
-# Safety
+# -------- Safety / Limits --------
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-SUPPORTED = ("png","jpg","jpeg","webp","bmp")
-MAX_MB = 12
-Q_MIN, Q_MAX = 60, 100
-REQ_FACTOR = 8.0
-DPI_EXIF = (400, 400)
+SUPPORTED = ("png", "jpg", "jpeg", "webp", "bmp")
+MAX_MB = 12                 # target ukuran file maks per output
+Q_MIN, Q_MAX = 60, 100      # rentang kualitas JPEG (4:4:4)
+REQ_FACTOR = 8.0            # faktor upscale tetap 8×
+DPI_EXIF = (400, 400)       # metadata DPI 400
 
 st.set_page_config(page_title="Auto 8× Upscaler — Optimized", page_icon="🖼️", layout="wide")
 st.title("🖼️ Auto Intelligent Proportional Upscaler — 8×")
-st.caption("Upscale 8× proporsional (tanpa crop/padding). Auto preset & Face Glow. Matte Skin opsional. Hasil ≤ 12 MB (JPEG 4:4:4, DPI 400). Preview & tombol **Unduh semua**.")
+st.caption("Upscale 8× proporsional (tanpa crop/padding). Auto preset & Face Glow. Matte Skin opsional. Pro Camera look. Hasil ≤ 12 MB (JPEG 4:4:4, DPI 400). Preview & tombol **Unduh semua**.")
+
+# ---------- Defaults (hindari NameError saat mode Auto) ----------
+resampler_ui   = "Bicubic"
+sharpen_amt_ui = 0.8
+micro_contrast_ui = 1.1
+usm_radius_ui  = 0.9
+usm_percent_ui = 120
+usm_thresh_ui  = 2
+enable_face_glow = True
+glow_strength  = 40
+face_pad       = 1.2
+matte_on       = False
+matte_strength = 30
+matte_pad      = 1.15
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -44,8 +58,7 @@ with st.sidebar:
         glow_strength = st.slider("Intensitas Glow", 0, 100, 40, 5, disabled=not HAS_CV2)
         face_pad = st.slider("Padding area wajah", 0.9, 1.6, 1.2, 0.05, disabled=not HAS_CV2)
     else:
-        st.caption("Auto: Face Glow menyala bila wajah terdeteksi, intensitas adaptif.")
-        enable_face_glow = True; glow_strength = None; face_pad = None
+        st.caption("Auto: Face Glow menyala bila wajah terdeteksi, intensitas & padding adaptif.")
 
     matte_on = st.toggle("Matte Skin (halus natural di wajah)", value=False, help="Menghaluskan kulit wajah tanpa ‘plastik’.")
     matte_strength = st.slider("Kekuatan Matte Skin", 0, 100, 30, 5, disabled=not matte_on)
@@ -54,7 +67,11 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Preset / Tweak")
     if mode == "Manual":
-        preset = st.selectbox("Preset", ["Default Natural", "Anti-Halo", "Tekstur Kain", "Kustom"], index=0)
+        preset = st.selectbox(
+            "Preset",
+            ["Default Natural", "Anti-Halo", "Tekstur Kain", "Pro Camera (R5-like)", "Kustom"],
+            index=0
+        )
         resampler_ui = st.radio("Resampler", ["Bicubic", "Lanczos"], index=0, disabled=(preset!="Kustom"))
         sharpen_amt_ui = st.slider("Sharpness", 0.0, 2.0, 0.8, 0.1, disabled=(preset!="Kustom"))
         micro_contrast_ui = st.slider("Mikro-kontras", 1.0, 1.6, 1.1, 0.05, disabled=(preset!="Kustom"))
@@ -76,7 +93,7 @@ def orientation_of(w, h):
     return "Square"
 
 def resample_filter(name: str):
-    return Image.BICUBIC if name == "bicubic" else Image.LANCZOS
+    return Image.BICUBIC if name == "Bicubic" or name == "bicubic" else Image.LANCZOS
 
 def capped_factor_for_cloud(src_w, src_h, req_factor: float, max_mp: int | None):
     if not max_mp:
@@ -86,6 +103,7 @@ def capped_factor_for_cloud(src_w, src_h, req_factor: float, max_mp: int | None)
     return max(1.0, min(req_factor, max_factor))
 
 def upscale_stepwise(img: Image.Image, factor: float, filt, step=1.8):
+    """Upscale bertahap untuk stabilitas & kualitas."""
     if factor <= 1.0:
         return img
     w, h = img.size
@@ -130,7 +148,7 @@ def maximize_under_cap(im: Image.Image, cap_bytes: int):
             hiq = mid - 1
     return best[0], best[1], "tight fit"
 
-# ---- Face detection & masks ----
+# ---- Face detection (fast, scaled) ----
 if HAS_CV2:
     @st.cache_resource
     def load_cascade():
@@ -165,12 +183,10 @@ def _make_face_mask(h, w, faces, pad_scale):
             yy, xx = np.ogrid[:h, :w]
             mx = ((xx-center[0])/(axes[0]+1e-6))**2 + ((yy-center[1])/(axes[1]+1e-6))**2 <= 1
             mask[mx] = 1.0
-    k = max(21, ((w+h)//180)*2 + 1)
+    # feather: jika ada cv2, blur; jika tidak, biarkan soft minimal (tanpa dependensi lain)
     if HAS_CV2:
+        k = max(21, ((w+h)//180)*2 + 1)
         mask = cv2.GaussianBlur(mask, (k, k), sigmaX=k/6)
-    else:
-        from scipy.ndimage import gaussian_filter
-        mask = gaussian_filter(mask, sigma=k/6)
     return mask
 
 def apply_face_glow(img: Image.Image, faces, strength=40, pad_scale=1.2):
@@ -181,7 +197,6 @@ def apply_face_glow(img: Image.Image, faces, strength=40, pad_scale=1.2):
     base = arr.astype(np.float32) / 255.0
     mask = _make_face_mask(h, w, faces, pad_scale)
 
-    # brighten in LAB + bilateral smoothing ringan
     if HAS_CV2:
         lab = cv2.cvtColor((base*255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         L, A, B = cv2.split(lab)
@@ -199,29 +214,72 @@ def apply_face_glow(img: Image.Image, faces, strength=40, pad_scale=1.2):
     return Image.fromarray(np.clip(out*255, 0, 255).astype(np.uint8))
 
 def apply_matte_skin(img: Image.Image, faces, strength=30, pad_scale=1.15):
-    """Haluskan kulit hanya pada wajah; blend lembut agar tidak ‘plastik’."""
     if len(faces) == 0 or not HAS_CV2 or strength <= 0:
         return img
     arr = np.array(img.convert("RGB"))
     h, w = arr.shape[:2]
     base = arr.astype(np.float32) / 255.0
     mask = _make_face_mask(h, w, faces, pad_scale)
-
-    # smoothing: bilateral sedikit lebih kuat + campur ke base
     sm = cv2.bilateralFilter(arr, d=7, sigmaColor=25+int(strength*0.7), sigmaSpace=25+int(strength*0.7))
     sm = sm.astype(np.float32) / 255.0
-
-    # blend strength → alpha max 0.6
     alpha = min(0.6, 0.25 + strength/100.0 * 0.35)
     out = base*(1.0 - (mask*alpha)[...,None]) + sm*(mask*alpha)[...,None]
     return Image.fromarray(np.clip(out*255, 0, 255).astype(np.uint8))
 
+# ---- Pro Camera (R5-like) ----
+def filmic_tonemap_L(L):
+    Lf = L.astype(np.float32) / 255.0
+    a, b, c, d, e, f = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
+    num = (Lf*(a*Lf + c*b) + d*e)
+    den = (Lf*(a*Lf + b) + d*f) - e
+    out = np.clip(num / np.maximum(den, 1e-6), 0, 1)
+    return (out * 255.0).astype(np.uint8)
+
+def apply_pro_camera_look(pil_img: Image.Image, strength: float = 0.8, vignette: bool = True) -> Image.Image:
+    if not HAS_CV2:
+        # fallback ringan tanpa cv2: sedikit contrast & saturation
+        im = pil_img.convert("RGB")
+        im = ImageEnhance.Contrast(im).enhance(1.05 + 0.05*strength)
+        im = ImageEnhance.Color(im).enhance(1.05 + 0.05*strength)
+        return im
+    img = np.array(pil_img.convert("RGB"))
+    h, w = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    L, A, B = cv2.split(lab)
+    L_tm = filmic_tonemap_L(L)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    L_cl = clahe.apply(L_tm)
+    lab2 = cv2.merge((L_cl, A, B))
+    base = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB).astype(np.float32) / 255.0
+    hsv = cv2.cvtColor((base*255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    H, S, V = cv2.split(hsv)
+    S = np.clip(S * (1.0 + 0.06*strength), 0, 255)
+    V = np.clip(V * (1.0 + 0.02*strength), 0, 255)
+    hsv2 = cv2.merge((H, S, V)).astype(np.uint8)
+    graded = cv2.cvtColor(hsv2, cv2.COLOR_HSV2RGB).astype(np.float32)/255.0
+    shadows = (base < 0.35).astype(np.float32)
+    graded[...,1] = np.clip(graded[...,1] + 0.03*strength*shadows[...,0], 0, 1)
+    graded[...,2] = np.clip(graded[...,2] + 0.02*strength*shadows[...,0], 0, 1)
+    out = graded
+    if vignette:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        cx, cy = w/2, h/2
+        r = np.sqrt((xx-cx)**2 + (yy-cy)**2) / np.sqrt(cx*cx + cy*cy)
+        vig = 1.0 - 0.18*strength*(r**1.5)
+        vig = np.clip(vig[...,None], 0.85, 1.0)
+        out = np.clip(out*vig, 0, 1)
+    out8 = (out*255).astype(np.uint8)
+    out8 = cv2.detailEnhance(out8, sigma_s=5, sigma_r=0.15)
+    sh = cv2.GaussianBlur(out8, (0,0), 1.0)
+    out8 = cv2.addWeighted(out8, 1.0+0.15*strength, sh, -0.15*strength, 0)
+    return Image.fromarray(out8)
+
 # -------------- Auto params --------------
 def auto_params(has_face: bool, res_pixels: int):
     if has_face:
-        resampler = "bicubic"; sharpen = 0.8; micro_c = 1.08; usm_r, usm_p, usm_t = 0.8, 110, 3
+        resampler = "Bicubic"; sharpen = 0.8; micro_c = 1.08; usm_r, usm_p, usm_t = 0.8, 110, 3
     else:
-        resampler = "lanczos"; sharpen = 1.0; micro_c = 1.18; usm_r, usm_p, usm_t = 1.0, 140, 2
+        resampler = "Lanczos";  sharpen = 1.0; micro_c = 1.18; usm_r, usm_p, usm_t = 1.0, 140, 2
     if res_pixels > 70_000_000:
         sharpen -= 0.1; micro_c -= 0.03; usm_p = int(usm_p * 0.9)
     return dict(resampler=resampler, sharpen_amt=max(0.5, sharpen),
@@ -254,7 +312,6 @@ if st.button("🚀 Jalankan 8×"):
 
                 # --- 1) Faktor efektif (Mode Ringan) ---
                 max_mp = max_out_mp if lite_mode else None
-                src_px = src_w * src_h
                 eff_factor = capped_factor_for_cloud(src_w, src_h, REQ_FACTOR, max_mp)
                 target_w, target_h = int(src_w * eff_factor), int(src_h * eff_factor)
 
@@ -264,7 +321,7 @@ if st.button("🚀 Jalankan 8×"):
                     eff_factor = 1.0
                     was_capped = False
                 else:
-                    filt = resample_filter("bicubic")
+                    filt = resample_filter("Bicubic")
                     out = upscale_stepwise(img, eff_factor, filt)
                     was_capped = eff_factor < REQ_FACTOR
 
@@ -274,35 +331,59 @@ if st.button("🚀 Jalankan 8×"):
                     has_face = len(faces) > 0
                     p = auto_params(has_face, out.width*out.height)
                     out = gentle_sharpen(out, p["sharpen_amt"], p["micro_contrast"], p["usm_radius"], p["usm_percent"], p["usm_thresh"])
-                    if has_face and HAS_CV2 and enable_face_glow:
+                    if has_face and HAS_CV2:
                         g_strength = 35 if out.width*out.height < 50_000_000 else 28
                         out = apply_face_glow(out, faces, strength=g_strength, pad_scale=1.2)
-                    if has_face and HAS_CV2 and matte_on:
-                        out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
+                        if matte_on:
+                            out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
+                    # Pro camera look ringan
+                    out = apply_pro_camera_look(out, strength=(0.6 if has_face else 0.8), vignette=True)
                     preset_used = "AUTO (Human)" if has_face else "AUTO (Produk/Kain)"
+                    faces_count = len(faces)
                 else:
-                    # Manual preset/kustom
+                    # Manual
                     if preset == "Default Natural":
-                        p = dict(resampler="bicubic", sharpen_amt=0.8, micro_contrast=1.10, usm_radius=0.9, usm_percent=120, usm_thresh=2)
+                        p = dict(sharpen_amt=0.8, micro_contrast=1.10, usm_radius=0.9, usm_percent=120, usm_thresh=2)
+                        out = gentle_sharpen(out, **p)
+                        faces = detect_faces_fast(out, max_side=1024) if HAS_CV2 else []
+                        faces_count = len(faces)
+                        if enable_face_glow and HAS_CV2 and faces_count>0:
+                            out = apply_face_glow(out, faces, strength=glow_strength, pad_scale=face_pad)
+                        if matte_on and HAS_CV2 and faces_count>0:
+                            out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
                     elif preset == "Anti-Halo":
-                        p = dict(resampler="bicubic", sharpen_amt=0.6, micro_contrast=1.05, usm_radius=0.7, usm_percent=90, usm_thresh=3)
+                        p = dict(sharpen_amt=0.6, micro_contrast=1.05, usm_radius=0.7, usm_percent=90, usm_thresh=3)
+                        out = gentle_sharpen(out, **p)
+                        faces = detect_faces_fast(out, max_side=1024) if HAS_CV2 else []
+                        faces_count = len(faces)
+                        if enable_face_glow and HAS_CV2 and faces_count>0:
+                            out = apply_face_glow(out, faces, strength=glow_strength, pad_scale=face_pad)
+                        if matte_on and HAS_CV2 and faces_count>0:
+                            out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
                     elif preset == "Tekstur Kain":
-                        p = dict(resampler="lanczos", sharpen_amt=1.05, micro_contrast=1.18, usm_radius=1.0, usm_percent=140, usm_thresh=2)
-                    else:
-                        p = dict(resampler=("bicubic" if resampler_ui=="Bicubic" else "lanczos"),
-                                 sharpen_amt=sharpen_amt_ui, micro_contrast=micro_contrast_ui,
+                        p = dict(sharpen_amt=1.05, micro_contrast=1.18, usm_radius=1.0, usm_percent=140, usm_thresh=2)
+                        out = gentle_sharpen(out, **p)
+                        faces = detect_faces_fast(out, max_side=1024) if HAS_CV2 else []
+                        faces_count = len(faces)
+                    elif preset == "Pro Camera (R5-like)":
+                        p = dict(sharpen_amt=0.75, micro_contrast=1.08, usm_radius=0.8, usm_percent=110, usm_thresh=3)
+                        out = gentle_sharpen(out, **p)
+                        out = apply_pro_camera_look(out, strength=0.8, vignette=True)
+                        faces = detect_faces_fast(out, max_side=1024) if HAS_CV2 else []
+                        faces_count = len(faces)
+                    else:  # Kustom
+                        p = dict(sharpen_amt=sharpen_amt_ui, micro_contrast=micro_contrast_ui,
                                  usm_radius=usm_radius_ui, usm_percent=usm_percent_ui, usm_thresh=usm_thresh_ui)
-                    out = gentle_sharpen(out, p["sharpen_amt"], p["micro_contrast"], p["usm_radius"], p["usm_percent"], p["usm_thresh"])
-                    faces = detect_faces_fast(out, max_side=1024) if HAS_CV2 else []
-                    if enable_face_glow and HAS_CV2:
-                        out = apply_face_glow(out, faces, strength=glow_strength, pad_scale=1.2 if face_pad is None else face_pad)
-                    if matte_on and HAS_CV2:
-                        out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
-                    if (enable_face_glow or matte_on) and not HAS_CV2:
-                        st.info("OpenCV tidak tersedia di server: efek wajah (Face Glow/Matte) dilewati.")
+                        out = gentle_sharpen(out, **p)
+                        faces = detect_faces_fast(out, max_side=1024) if HAS_CV2 else []
+                        faces_count = len(faces)
+                        if enable_face_glow and HAS_CV2 and faces_count>0:
+                            out = apply_face_glow(out, faces, strength=glow_strength, pad_scale=face_pad)
+                        if matte_on and HAS_CV2 and faces_count>0:
+                            out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
                     preset_used = preset
 
-                # --- 4) Encode ≤ 12 MB ---
+                # --- 4) Encode ≤ 12 MB (JPEG 4:4:4, DPI 400) ---
                 data, used_q, note = maximize_under_cap(out, cap_bytes)
 
                 # --- 5) Preview & per-image download ---
@@ -314,13 +395,12 @@ if st.button("🚀 Jalankan 8×"):
                     st.subheader("Sesudah (8×)")
                     new_w, new_h = out.size
                     size_mb = len(data) / (1024 * 1024)
-                    faces_count = len(detect_faces_fast(out, max_side=1024)) if HAS_CV2 else 0
                     captext = (
                         f"{Path(f.name).stem}_{suffix}.jpg — {new_w}×{new_h}px | {src_orient} | "
                         f"req 8.0× → eff {eff_factor:.2f}×" + (" (capped)" if was_capped else "") +
                         (f" | faces: {faces_count}" if HAS_CV2 else " | faces: n/a") +
-                        (f" | Matte:{'on' if (matte_on and HAS_CV2) else 'off'}" ) +
-                        (f" | FaceGlow:{'on' if (enable_face_glow and HAS_CV2 and faces_count>0) else 'off'}") +
+                        (f" | Matte:{'on' if (matte_on and HAS_CV2 and faces_count>0) else 'off'}") +
+                        (f" | FaceGlow:{'on' if (HAS_CV2 and ((mode=='Auto' and faces_count>0) or (mode=='Manual' and enable_face_glow and faces_count>0))) else 'off'}") +
                         f" | preset: {preset_used} | q={used_q} | {size_mb:.2f} MB ({note}) | DPI 400"
                     )
                     st.image(out, caption=captext, use_column_width=True)
@@ -345,4 +425,4 @@ if st.button("🚀 Jalankan 8×"):
                     zf.writestr(fname, blob)
             zip_buf.seek(0)
             st.success(f"Selesai! {len(all_results)} file siap diunduh.")
-            st.download_button("📦 Unduh semua (ZIP)", zip_buf, file_name="results_upscaled.zip", mime="application/zip")                
+            st.download_button("📦 Unduh semua (ZIP)", zip_buf, file_name="results_upscaled.zip", mime="application/zip")
