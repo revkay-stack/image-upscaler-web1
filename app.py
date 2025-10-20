@@ -1,22 +1,24 @@
-# app.py — Proportional Upscaler 8× + Presets + Before/After Preview (≤12 MB)
+# app.py — Proportional 8× Upscaler + Face Glow + Preview, ≤12 MB, DPI 400
 import io, math
 from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageFilter, ImageFile, ImageEnhance
+import numpy as np
+import cv2
 
 # Safety
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 SUPPORTED = ("png","jpg","jpeg","webp","bmp")
-MAX_MB = 12                      # batas ukuran file
-Q_MIN, Q_MAX = 60, 100           # range kualitas JPEG (4:4:4)
-MAX_OUT_PIXELS = 120_000_000     # pagar aman Cloud (~120 MP)
-REQ_FACTOR = 8.0                 # faktor upscale tetap 8×
+MAX_MB = 12                        # ukuran file maksimum
+Q_MIN, Q_MAX = 60, 100             # rentang kualitas JPEG (4:4:4)
+MAX_OUT_PIXELS = 120_000_000       # pagar aman Cloud (~120 MP)
+REQ_FACTOR = 8.0                   # faktor upscale tetap 8×
 
-st.set_page_config(page_title="Proportional Upscaler 8× — Presets", page_icon="🖼️", layout="wide")
-st.title("🖼️ Proportional Upscaler — 8× (dengan Preset & Preview)")
-st.caption("Upscale proporsional 8× tanpa crop/padding. Preset cepat: Natural, Anti-Halo, Tekstur Kain (atau Kustom). File dimaksimalkan hingga ≤ 12 MB per gambar (JPEG 4:4:4).")
+st.set_page_config(page_title="Proportional Upscaler 8× — Face Glow", page_icon="🖼️", layout="wide")
+st.title("🖼️ Proportional Upscaler — 8× (Face Glow + Preview)")
+st.caption("Upscale proporsional 8× tanpa crop/padding. Otomatis deteksi wajah dan memberi efek glow alami. Simpan JPEG 4:4:4 ≤ 12 MB, DPI 400. Unduh per gambar.")
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -24,6 +26,12 @@ with st.sidebar:
     preset = st.selectbox("Preset kualitas", ["Default Natural", "Anti-Halo", "Tekstur Kain", "Kustom"], index=0)
     keep_if_bigger = st.toggle("Jika sumber sudah besar, jangan perkecil (keep)", value=True)
     suffix = st.text_input("Akhiran nama file", value="x8")
+
+    st.markdown("---")
+    st.subheader("Face Glow")
+    enable_face_glow = st.toggle("Aktifkan Face Glow (auto)", value=True)
+    glow_strength = st.slider("Intensitas Glow", 0, 100, 40, 5, help="Semakin besar semakin cerah/halus pada area wajah.")
+    face_pad = st.slider("Lebar area wajah (padding)", 0.8, 1.6, 1.2, 0.05, help="Perbesar area efek di sekitar wajah.")
 
     st.markdown("---")
     st.subheader("Tweak lanjutan" + (" (aktif karena Kustom)" if preset == "Kustom" else " (opsional)"))
@@ -82,22 +90,90 @@ def gentle_sharpen(pil_img: Image.Image, sharpen_amt: float, micro_c: float, usm
         out = ImageEnhance.Contrast(out).enhance(micro_c)
     return out
 
-def encode_jpeg_444(im: Image.Image, q: int) -> bytes:
+# --- Face detection & glow ---
+_haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+FACE_CASCADE = cv2.CascadeClassifier(_haar_path)
+
+def detect_faces(pil_img: Image.Image):
+    """Return list of (x,y,w,h) in upscaled RGB image."""
+    rgb = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    # parameters tuned for large images
+    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60,60))
+    return faces
+
+def apply_face_glow(pil_img: Image.Image, faces, strength:int=40, pad_scale:float=1.2) -> Image.Image:
+    """
+    Glow natural pada wajah:
+    - LAB: boost L-channel (kecerahan) + sedikit smoothing bilateral
+    - Feathered mask agar halus di tepi
+    strength: 0..100 → di-mapping ke gain & softness
+    pad_scale: perbesar area efek di sekitar bbox wajah
+    """
+    if len(faces) == 0 or strength <= 0:
+        return pil_img
+
+    img = np.array(pil_img.convert("RGB"))
+    h, w = img.shape[:2]
+    base = img.astype(np.float32) / 255.0
+
+    # mask kosong
+    mask = np.zeros((h, w), dtype=np.float32)
+
+    for (x, y, fw, fh) in faces:
+        # perluas area
+        cx, cy = x + fw/2, y + fh/2
+        ew, eh = fw * pad_scale, fh * pad_scale
+        # ellipse mask
+        axes = (int(ew/2), int(eh/2))
+        center = (int(cx), int(cy))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, thickness=-1)
+
+    # feathering
+    blur_ksize = max(31, int((w+h)/200)*2+1)  # adaptif
+    mask = cv2.GaussianBlur(mask, (blur_ksize, blur_ksize), sigmaX=blur_ksize/6)
+
+    # buat versi "glow" dari gambar: brighten + soft smooth + slight clarity
+    lab = cv2.cvtColor((base*255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab)
+    # mapping strength -> gain L (1.0..1.35) & bilateral strength
+    gain = 1.0 + (strength/100.0)*0.35
+    L = np.clip(L * gain, 0, 255)
+    lab_glow = cv2.merge((L, A, B)).astype(np.uint8)
+    glow = cv2.cvtColor(lab_glow, cv2.COLOR_LAB2RGB).astype(np.float32)/255.0
+
+    # softening kecil untuk kulit (bilateral ringan)
+    d = 5
+    sc = 20 + int(strength*0.6)
+    ss = 20 + int(strength*0.6)
+    glow_bgr = cv2.cvtColor((glow*255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    glow_bgr = cv2.bilateralFilter(glow_bgr, d=d, sigmaColor=sc, sigmaSpace=ss)
+    glow = cv2.cvtColor(glow_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+
+    # blend berdasarkan mask (per-channel)
+    mask3 = np.dstack([mask, mask, mask])
+    out = base*(1.0 - mask3) + glow*mask3
+    out = np.clip(out, 0, 1)
+
+    return Image.fromarray((out*255).astype(np.uint8))
+
+def encode_jpeg_444_dpi(im: Image.Image, q: int, dpi_val=(400,400)) -> bytes:
+    """JPEG 4:4:4 dengan DPI 400 untuk metadata kerapatan piksel."""
     if im.mode != "RGB": im = im.convert("RGB")
     buf = io.BytesIO()
-    im.save(buf, "JPEG", quality=q, optimize=True, progressive=True, subsampling=0)  # 4:4:4
+    im.save(buf, "JPEG", quality=q, optimize=True, progressive=True, subsampling=0, dpi=dpi_val)
     return buf.getvalue()
 
 def maximize_under_cap(im: Image.Image, cap_bytes: int):
-    """Binary search kualitas agar ukuran mendekati cap (≤ MAX_MB)."""
-    hi = encode_jpeg_444(im, 100)
+    """Binary search kualitas agar ukuran mendekati cap (≤ MAX_MB) + DPI 400."""
+    hi = encode_jpeg_444_dpi(im, 100)
     if len(hi) <= cap_bytes:
         return hi, 100, "q=100 (maks)"
     lo_q, hi_q = Q_MIN, Q_MAX
-    best = (encode_jpeg_444(im, lo_q), lo_q)
+    best = (encode_jpeg_444_dpi(im, lo_q), lo_q)
     while lo_q <= hi_q:
         mid = (lo_q + hi_q) // 2
-        data = encode_jpeg_444(im, mid)
+        data = encode_jpeg_444_dpi(im, mid)
         if len(data) <= cap_bytes:
             best = (data, mid); lo_q = mid + 1
         else:
@@ -105,7 +181,7 @@ def maximize_under_cap(im: Image.Image, cap_bytes: int):
     return best[0], best[1], "tight fit"
 
 # ---------- Process ----------
-if st.button("🚀 Proses 8× (dengan Preview)"):
+if st.button("🚀 Proses 8× (Face Glow + Preview)"):
     if not uploaded:
         st.warning("Unggah minimal satu gambar.")
     else:
@@ -130,8 +206,7 @@ if st.button("🚀 Proses 8× (dengan Preview)"):
 
                 # 1) Upscale 8× (aman Cloud)
                 out, eff_factor, was_capped = resize_with_factor(img, REQ_FACTOR, method=params["resampler"])
-
-                # Jika sumber lebih besar & keep_if_bigger aktif, biarkan asli (tanpa downscale)
+                # Jika sumber lebih besar & keep_if_bigger aktif → pakai asli (hindari downscale)
                 if keep_if_bigger and (out.width <= src_w or out.height <= src_h):
                     out = img
                     eff_factor = 1.0
@@ -147,10 +222,15 @@ if st.button("🚀 Proses 8× (dengan Preview)"):
                     params["usm_thresh"],
                 )
 
-                # 3) Encode maksimal hingga ≤ 12 MB (JPEG 4:4:4)
+                # 3) Face Glow (opsional)
+                if enable_face_glow:
+                    faces = detect_faces(out)
+                    out = apply_face_glow(out, faces, strength=glow_strength, pad_scale=face_pad)
+
+                # 4) Encode maksimal hingga ≤ 12 MB (JPEG 4:4:4, DPI 400)
                 data, used_q, note = maximize_under_cap(out, cap_bytes)
 
-                # 4) Preview Before / After + Download
+                # 5) Preview Before / After + Download
                 col1, col2 = st.columns(2, gap="large")
                 with col1:
                     st.subheader("Sebelum")
@@ -162,7 +242,8 @@ if st.button("🚀 Proses 8× (dengan Preview)"):
                     captext = (
                         f"{Path(f.name).stem}_{suffix}.jpg — {new_w}×{new_h}px | {src_orient} | "
                         f"req 8.0× → eff {eff_factor:.2f}×" + (" (capped)" if was_capped else "") +
-                        f" | preset: {preset} | q={used_q} | {size_mb:.2f} MB ({note})"
+                        (f" | FaceGlow on ({len(detect_faces(out))} wajah)" if enable_face_glow else " | FaceGlow off") +
+                        f" | preset: {preset} | q={used_q} | {size_mb:.2f} MB ({note}) | DPI 400"
                     )
                     st.image(out, caption=captext, use_column_width=True)
                     st.download_button(
@@ -174,4 +255,4 @@ if st.button("🚀 Proses 8× (dengan Preview)"):
 
             except Exception as e:
                 st.error(f"Gagal memproses {f.name}: {e}")
-            progress.progress(i / len(uploaded))                            
+            progress.progress(i / len(uploaded))
