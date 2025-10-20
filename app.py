@@ -93,7 +93,7 @@ def orientation_of(w, h):
     return "Square"
 
 def resample_filter(name: str):
-    return Image.BICUBIC if name == "Bicubic" or name == "bicubic" else Image.LANCZOS
+    return Image.BICUBIC if name.lower() == "bicubic" else Image.LANCZOS
 
 def capped_factor_for_cloud(src_w, src_h, req_factor: float, max_mp: int | None):
     if not max_mp:
@@ -119,12 +119,24 @@ def upscale_stepwise(img: Image.Image, factor: float, filt, step=1.8):
         cur = cur.resize((target_w, target_h), filt)
     return cur
 
-def gentle_sharpen(img: Image.Image, sharpen_amt: float, micro_c: float, usm_radius: float, usm_percent: int, usm_thresh: int):
+def gentle_sharpen(img: Image.Image,
+                   sharpen_amt: float,
+                   micro_contrast: float,
+                   usm_radius: float,
+                   usm_percent: int,
+                   usm_thresh: int,
+                   **kwargs):
+    """
+    Penajaman natural + mikro-kontras.
+    (Menerima alias 'micro_c' untuk kompatibilitas lama.)
+    """
+    if micro_contrast is None:
+        micro_contrast = kwargs.get("micro_c", 1.0)
     out = img.filter(ImageFilter.UnsharpMask(radius=usm_radius, percent=usm_percent, threshold=usm_thresh))
     if abs(sharpen_amt - 1.0) > 1e-3:
         out = ImageEnhance.Sharpness(out).enhance(sharpen_amt)
-    if abs(micro_c - 1.0) > 1e-3:
-        out = ImageEnhance.Contrast(out).enhance(micro_c)
+    if abs(micro_contrast - 1.0) > 1e-3:
+        out = ImageEnhance.Contrast(out).enhance(micro_contrast)
     return out
 
 def encode_jpeg_444_dpi(im: Image.Image, q: int) -> bytes:
@@ -166,7 +178,7 @@ def detect_faces_fast(pil_img: Image.Image, max_side=1024):
         small = cv2.resize(rgb, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
     else:
         small = rgb
-    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    gray = HAS_CV2 and cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
     faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(24,24))
     return [(int(x/scale), int(y/scale), int(wd/scale), int(hd/scale)) for (x,y,wd,hd) in faces]
 
@@ -183,7 +195,6 @@ def _make_face_mask(h, w, faces, pad_scale):
             yy, xx = np.ogrid[:h, :w]
             mx = ((xx-center[0])/(axes[0]+1e-6))**2 + ((yy-center[1])/(axes[1]+1e-6))**2 <= 1
             mask[mx] = 1.0
-    # feather: jika ada cv2, blur; jika tidak, biarkan soft minimal (tanpa dependensi lain)
     if HAS_CV2:
         k = max(21, ((w+h)//180)*2 + 1)
         mask = cv2.GaussianBlur(mask, (k, k), sigmaX=k/6)
@@ -237,7 +248,6 @@ def filmic_tonemap_L(L):
 
 def apply_pro_camera_look(pil_img: Image.Image, strength: float = 0.8, vignette: bool = True) -> Image.Image:
     if not HAS_CV2:
-        # fallback ringan tanpa cv2: sedikit contrast & saturation
         im = pil_img.convert("RGB")
         im = ImageEnhance.Contrast(im).enhance(1.05 + 0.05*strength)
         im = ImageEnhance.Color(im).enhance(1.05 + 0.05*strength)
@@ -321,7 +331,7 @@ if st.button("🚀 Jalankan 8×"):
                     eff_factor = 1.0
                     was_capped = False
                 else:
-                    filt = resample_filter("Bicubic")
+                    filt = resample_filter("bicubic")
                     out = upscale_stepwise(img, eff_factor, filt)
                     was_capped = eff_factor < REQ_FACTOR
 
@@ -336,7 +346,6 @@ if st.button("🚀 Jalankan 8×"):
                         out = apply_face_glow(out, faces, strength=g_strength, pad_scale=1.2)
                         if matte_on:
                             out = apply_matte_skin(out, faces, strength=matte_strength, pad_scale=matte_pad)
-                    # Pro camera look ringan
                     out = apply_pro_camera_look(out, strength=(0.6 if has_face else 0.8), vignette=True)
                     preset_used = "AUTO (Human)" if has_face else "AUTO (Produk/Kain)"
                     faces_count = len(faces)
@@ -425,4 +434,4 @@ if st.button("🚀 Jalankan 8×"):
                     zf.writestr(fname, blob)
             zip_buf.seek(0)
             st.success(f"Selesai! {len(all_results)} file siap diunduh.")
-            st.download_button("📦 Unduh semua (ZIP)", zip_buf, file_name="results_upscaled.zip", mime="application/zip")
+            st.download_button("📦 Unduh semua (ZIP)", zip_buf, file_name="results_upscaled.zip", mime="application/zip")                    
